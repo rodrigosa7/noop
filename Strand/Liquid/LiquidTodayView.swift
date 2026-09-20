@@ -1773,7 +1773,7 @@ struct LiquidTodayView: View {
         let appleRows = await appleA
         let weightSeries = await weightA
         weightKg = appleRows.filter { $0.day == selectedDayKey }.compactMap { $0.weightKg }.max()
-            ?? weightSeries.last?.value
+            ?? weightSeries.last(where: { $0.day <= selectedDayKey })?.value
 
         // Awaited ONCE: the timestamps and the means have to come from the same read, or the segments
         // would describe a different series than the one drawn.
