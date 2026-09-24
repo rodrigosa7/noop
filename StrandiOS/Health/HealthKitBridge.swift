@@ -1624,8 +1624,8 @@ final class HealthKitBridge: ObservableObject {
 
     /// Read only HR samples associated with this HealthKit workout, excluding samples authored by NOOP.
     /// The workout association prevents same-window samples from unrelated sessions being counted.
-    nonisolated private static func fetchWorkoutHeartRate(for workout: HKWorkout,
-                                                           store: HKHealthStore) async -> [HRSample] {
+    private static func fetchWorkoutHeartRate(for workout: HKWorkout,
+                                               store: HKHealthStore) async -> [HRSample] {
         guard let type = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return [] }
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
             HKQuery.predicateForObjects(from: workout),
