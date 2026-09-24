@@ -1,6 +1,7 @@
 #if os(iOS)
 import Foundation
 import HealthKit
+import WhoopProtocol
 import CoreLocation
 import UIKit
 import WhoopStore
@@ -1535,30 +1536,11 @@ final class HealthKitBridge: ObservableObject {
         // with each workout; they cannot be read inside the sample query's completion handler
         // (HealthKit does not allow nested queries on the same store), so we hold the workouts and
         // fetch routes in a second pass below.
-        let workoutsAndRows: [(HKWorkout, WorkoutRow)] = await withCheckedContinuation { (cont: CheckedContinuation<[(HKWorkout, WorkoutRow)], Never>) in
+        let workoutsAndRows: [HKWorkout] = await withCheckedContinuation { (cont: CheckedContinuation<[HKWorkout], Never>) in
             let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
             let q = HKSampleQuery(sampleType: HKObjectType.workoutType(), predicate: predicate,
                                   limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
-                var pairs: [(HKWorkout, WorkoutRow)] = []
-                for case let workout as HKWorkout in samples ?? [] {
-                    let startTs = Int(workout.startDate.timeIntervalSince1970)
-                    let endTs = max(Int(workout.endDate.timeIntervalSince1970), startTs)
-                    let duration = workout.duration > 0 ? workout.duration : Double(endTs - startTs)
-                    pairs.append((workout, WorkoutRow(
-                        startTs: startTs,
-                        endTs: endTs,
-                        sport: Self.sportName(workout.workoutActivityType),
-                        source: HealthKitBridge.appleWorkoutSource,
-                        durationS: duration,
-                        energyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
-                        avgHr: nil,
-                        maxHr: nil,
-                        strain: nil,
-                        distanceM: workout.totalDistance?.doubleValue(for: .meter()),
-                        zonesJSON: nil,
-                        notes: nil, steps: nil)))
-                }
-                cont.resume(returning: pairs)
+                cont.resume(returning: (samples ?? []).compactMap { $0 as? HKWorkout })
             }
             store.execute(q)
         }
@@ -1571,17 +1553,99 @@ final class HealthKitBridge: ObservableObject {
         // 500-workout first import would decode and re-encode a 400-entry map 500 times, on the order of
         // a gigabyte of JSON through UserDefaults. `storeAll` applies the same eviction, once.
         var importedRoutes: [(route: WorkoutRoute, startTs: Int, sport: String)] = []
-        for (workout, row) in workoutsAndRows {
+        for workout in workoutsAndRows {
             if let route = await Self.fetchWorkoutRoute(for: workout, store: store),
                route.count >= 2 {
                 let polyline = RouteMath.encode(route)
                 let distanceM = RouteMath.totalMeters(route)
                 importedRoutes.append((WorkoutRoute(polyline: polyline, distanceM: distanceM),
-                                       row.startTs, row.sport))
+                                       Int(workout.startDate.timeIntervalSince1970),
+                                       Self.sportName(workout.workoutActivityType)))
             }
         }
         RouteStore.storeAll(importedRoutes)
-        return workoutsAndRows.map { $0.1 }
+        let profile = repo.strainProfile
+        var rows: [WorkoutRow] = []
+        rows.reserveCapacity(workoutsAndRows.count)
+        for workout in workoutsAndRows {
+            let startTs = Int(workout.startDate.timeIntervalSince1970)
+            let endTs = max(Int(workout.endDate.timeIntervalSince1970), startTs)
+            let samples = await Self.fetchWorkoutHeartRate(for: workout, store: store)
+            let steps = await Self.fetchWorkoutSteps(for: workout, store: store)
+            let scored: (avg: Int, peak: Int, strain: Double)? = {
+                guard let profile, let first = samples.first, let last = samples.last,
+                      samples.count >= 20, last.ts - first.ts >= 600 else { return nil }
+                let mean = Int((Double(samples.reduce(0) { $0 + $1.bpm }) / Double(samples.count)).rounded())
+                guard let strain = StrainScorer.strain(samples, maxHR: profile.hrMax,
+                                                       method: PuffinExperiment.effortMethod,
+                                                       sex: profile.sex) else { return nil }
+                return (mean, samples.map(\.bpm).max() ?? mean, strain)
+            }()
+            rows.append(WorkoutRow(
+                startTs: startTs, endTs: endTs,
+                sport: Self.sportName(workout.workoutActivityType),
+                source: HealthKitBridge.appleWorkoutSource,
+                durationS: workout.duration > 0 ? workout.duration : Double(endTs - startTs),
+                energyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+                avgHr: scored?.avg, maxHr: scored?.peak, strain: scored?.strain,
+                distanceM: workout.totalDistance?.doubleValue(for: .meter()),
+                zonesJSON: nil, notes: Self.workoutNotes(workout), steps: steps))
+        }
+        return rows
+    }
+
+    /// Notes are optional HealthKit workout metadata. Ignore absent, non-string, or whitespace-only values.
+    nonisolated private static func workoutNotes(_ workout: HKWorkout) -> String? {
+        guard let notes = workout.metadata?[HKMetadataKeyWorkoutBrandName] as? String else { return nil }
+        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// HealthKit has no direct step-count property on HKWorkout; query step samples for its time window.
+    /// Return nil on query failure or no usable samples, preserving "unknown" rather than reporting zero.
+    nonisolated private static func fetchWorkoutSteps(for workout: HKWorkout,
+                                                       store: HKHealthStore) async -> Int? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return nil }
+        let predicate = HKQuery.predicateForSamples(withStart: workout.startDate, end: workout.endDate,
+                                                     options: .strictStartDate)
+        return await withCheckedContinuation { (cont: CheckedContinuation<Int?, Never>) in
+            let query = HKStatisticsQuery(quantityType: type, quantitySamplePredicate: predicate,
+                                          options: .cumulativeSum) { _, statistics, error in
+                guard error == nil,
+                      let total = statistics?.sumQuantity()?.doubleValue(for: .count()),
+                      total.isFinite, total >= 0 else {
+                    cont.resume(returning: nil); return
+                }
+                cont.resume(returning: Int(total.rounded()))
+            }
+            store.execute(query)
+        }
+    }
+
+    /// Read only HR samples associated with this HealthKit workout. This is a read-only query; it does
+    /// not mix in strap samples from other sources or infer effort when the workout has no HR coverage.
+    nonisolated private static func fetchWorkoutHeartRate(for workout: HKWorkout,
+                                                           store: HKHealthStore) async -> [HRSample] {
+        guard let type = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return [] }
+        let predicate = HKQuery.predicateForSamples(withStart: workout.startDate, end: workout.endDate,
+                                                     options: .strictStartDate)
+        return await withCheckedContinuation { (cont: CheckedContinuation<[HRSample], Never>) in
+            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+            let query = HKSampleQuery(sampleType: type, predicate: predicate,
+                                      limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
+                guard error == nil, let samples = samples as? [HKQuantitySample] else {
+                    cont.resume(returning: []); return
+                }
+                let unit = HKUnit.count().unitDivided(by: .minute())
+                let result = samples.compactMap { sample -> HRSample? in
+                    let bpm = sample.quantity.doubleValue(for: unit)
+                    guard bpm.isFinite, bpm >= 25, bpm <= 240 else { return nil }
+                    return HRSample(ts: Int(sample.startDate.timeIntervalSince1970), bpm: Int(bpm.rounded()))
+                }
+                cont.resume(returning: result)
+            }
+            store.execute(query)
+        }
     }
 
     /// #1205: fetch the GPS route (list of `RouteMath.LatLng`) for a single `HKWorkout`.
