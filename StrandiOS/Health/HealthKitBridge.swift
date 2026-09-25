@@ -1572,14 +1572,28 @@ final class HealthKitBridge: ObservableObject {
             let endTs = max(Int(workout.endDate.timeIntervalSince1970), startTs)
             let samples = await Self.fetchWorkoutHeartRate(for: workout, store: store)
             let steps = await Self.fetchWorkoutSteps(for: workout, store: store)
-            let scored: (avg: Int, peak: Int, strain: Double)? = {
-                guard let profile, let first = samples.first, let last = samples.last,
-                      samples.count >= 20, last.ts - first.ts >= 600 else { return nil }
+            // Two gates, not one. A mean and a peak are readable from any beat the workout carries, so
+            // they are reported whenever there are samples, which is what `WorkoutSource` already does
+            // for a merged workout (`hrWeight > 0 ? … : nil`, no sample floor) rather than a threshold
+            // invented here. EFFORT is the number that needs coverage: it integrates time in zones, and
+            // a handful of beats over a few minutes would score a session that was never measured.
+            //
+            // Sharing one threshold meant a 15-sample, 8-minute workout with perfectly good heart rate
+            // showed blank Avg and Max as well as blank Effort. It also meant a wearer with NO strain
+            // profile got no heart rate at all from an import, because the old guard opened on
+            // `guard let profile`: avg and max never needed one.
+            let heartRate: (avg: Int, peak: Int)? = {
+                guard !samples.isEmpty else { return nil }
                 let mean = Int((Double(samples.reduce(0) { $0 + $1.bpm }) / Double(samples.count)).rounded())
-                guard let strain = StrainScorer.strain(samples, maxHR: profile.hrMax,
-                                                       method: PuffinExperiment.effortMethod,
-                                                       sex: profile.sex) else { return nil }
-                return (mean, samples.map(\.bpm).max() ?? mean, strain)
+                return (mean, samples.map(\.bpm).max() ?? mean)
+            }()
+            let effort: Double? = {
+                guard let profile, let first = samples.first, let last = samples.last,
+                      samples.count >= Self.effortMinimumSamples,
+                      last.ts - first.ts >= Self.effortMinimumSpanSeconds else { return nil }
+                return StrainScorer.strain(samples, maxHR: profile.hrMax,
+                                           method: PuffinExperiment.effortMethod,
+                                           sex: profile.sex)
             }()
             rows.append(WorkoutRow(
                 startTs: startTs, endTs: endTs,
@@ -1587,19 +1601,23 @@ final class HealthKitBridge: ObservableObject {
                 source: HealthKitBridge.appleWorkoutSource,
                 durationS: workout.duration > 0 ? workout.duration : Double(endTs - startTs),
                 energyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
-                avgHr: scored?.avg, maxHr: scored?.peak, strain: scored?.strain,
+                avgHr: heartRate?.avg, maxHr: heartRate?.peak, strain: effort,
                 distanceM: workout.totalDistance?.doubleValue(for: .meter()),
-                zonesJSON: nil, notes: Self.workoutNotes(workout), steps: steps))
+                zonesJSON: nil, notes: nil, steps: steps))
         }
         return rows
     }
 
-    /// Notes are optional HealthKit workout metadata. Ignore absent, non-string, or whitespace-only values.
-    nonisolated private static func workoutNotes(_ workout: HKWorkout) -> String? {
-        guard let notes = workout.metadata?[HKMetadataKeyWorkoutBrandName] as? String else { return nil }
-        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
+    /// Beats an imported workout must carry before its EFFORT is scored.
+    ///
+    /// Effort integrates time in heart-rate zones, so it needs a session actually measured rather than a
+    /// few beats sampled from one. Avg and Max deliberately do NOT sit behind this: they are honest at
+    /// any sample count, and gating them here left workouts blank that HealthKit could answer.
+    private static let effortMinimumSamples = 20
+
+    /// Seconds an imported workout's beats must span before its EFFORT is scored. See
+    /// [effortMinimumSamples]; twenty beats crowded into a minute is not ten minutes of measurement.
+    private static let effortMinimumSpanSeconds = 600
 
     /// HealthKit has no direct step-count property on HKWorkout; query step samples for its time window.
     /// Return nil on query failure or no usable samples, preserving "unknown" rather than reporting zero.
