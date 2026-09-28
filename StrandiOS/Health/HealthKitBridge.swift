@@ -515,8 +515,16 @@ final class HealthKitBridge: ObservableObject {
         await collect(.respiratoryRate, unit: HKUnit.count().unitDivided(by: .minute()), start: start, end: end, op: .discreteAverage) { day, v in
             var a = agg(day); a.respRate = v; byDay[day] = a
         }
-        await collect(.stepCount, unit: .count(), start: start, end: end, op: .cumulativeSum) { day, v in
+        let stepsReadOk = await collect(.stepCount, unit: .count(), start: start, end: end, op: .cumulativeSum) { day, v in
             var a = agg(day); a.steps = v; byDay[day] = a
+        }
+        // A failed query is not an empty step history. Stop before upserting AppleDaily: its conflict
+        // update replaces the stored count with nil when another Health metric populated that day.
+        // The next foreground or observer sync can retry without losing the last good reading.
+        guard stepsReadOk else {
+            lastSyncDays = 0
+            lastError = String(localized: "Apple Health sync failed: \(String(localized: "Steps"))")
+            return false
         }
         await collect(.activeEnergyBurned, unit: .kilocalorie(), start: start, end: end, op: .cumulativeSum) { day, v in
             var a = agg(day); a.activeKcal = v; byDay[day] = a
