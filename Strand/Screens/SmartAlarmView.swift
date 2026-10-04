@@ -6,14 +6,8 @@ import UIKit
 import AppKit
 #endif
 
-/// Smart alarm (#207) — the iOS/macOS surface.
-///
-/// HONEST by design: a sideloaded, backgrounded app on iOS can't fire a dependable LOUD wake alarm
-/// (that needs the critical-alert entitlement, which a non-App-Store build doesn't have), so this
-/// platform deliberately does NOT offer a wake alarm. The dependable phone wake lives on Android,
-/// which has the exact-alarm primitive. Here we offer the cross-platform WIND-DOWN nudge — a gentle
-/// evening reminder — and we say plainly why there's no wake alarm, rather than promising one we
-/// can't keep.
+/// Shared wake schedule, strap alarm, and wind-down reminder. On iOS 26+ AlarmKit also supplies an
+/// opt-in phone alarm at the selected wake time. Live heart-rate early wake remains Android-only.
 struct SmartAlarmView: View {
     // #766: this is now the ONE alarm surface. The strap's silent firmware wake-alarm used to live in a
     // separate card over in Automations, which let users conflate it with the wind-down reminder; it's
@@ -21,6 +15,9 @@ struct SmartAlarmView: View {
     // alarm over BLE) and the behavior store (the alarm's persisted on/time/weekdays).
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var behavior: BehaviorStore
+    #if os(iOS)
+    @StateObject private var phoneAlarm = PhoneWakeAlarmScheduler.shared
+    #endif
 
     @State private var windDownOn = WindDownNudge.isEnabled
     /// Shown when the user flips the nudge on but notifications are denied at the OS level — the reminder
@@ -38,7 +35,7 @@ struct SmartAlarmView: View {
     // which the strapRejectedCard surfaces with reset guidance. @AppStorage so it updates live.
     @AppStorage("alarm.rejectStreak") private var alarmRejectStreak = 0
     /// Calendar weekday numbers laid out Monday-first (Mon…Sun → 2,3,4,5,6,7,1), matching AutomationsView.
-    private static let weekdayOrder = [2, 3, 4, 5, 6, 7, 1]
+    nonisolated private static let weekdayOrder = [2, 3, 4, 5, 6, 7, 1]
 
     var body: some View {
         // #766: retitled to "Alarms" because it now holds BOTH the strap's silent wake-alarm and the
@@ -53,11 +50,19 @@ struct SmartAlarmView: View {
                 wakeScheduleCard
                 strapAlarmCard
                 strapRejectedCard   // #34: only shows when the strap keeps refusing the alarm
+                #if os(iOS)
+                if #available(iOS 26.0, *) { phoneAlarmCard }
+                #endif
                 windDownCard
                 honestyCard
             }
         }
-        .onAppear(perform: unifyWakeTimesOnce)
+        .onAppear {
+            unifyWakeTimesOnce()
+            #if os(iOS)
+            phoneAlarm.reconcile(schedule: phoneSchedule)
+            #endif
+        }
         .alert(String(localized: "Notifications are off"), isPresented: $showNotifDeniedAlert) {
             Button(String(localized: "Open Settings")) { Self.openNotificationSettings() }
             Button(String(localized: "Not now"), role: .cancel) {}
@@ -201,14 +206,71 @@ struct SmartAlarmView: View {
                     Text("The strap alarm is a silent buzz, not a sound")
                         .font(StrandFont.headline)
                         .foregroundStyle(StrandPalette.textPrimary)
-                    Text("The wake-alarm above buzzes your wrist from the strap's own firmware. It can't sound a loud alarm. We also schedule a backup notification at your wake time, but a sideloaded app can't sound a guaranteed wake on this device (that needs a critical-alert permission this build doesn't have), so Focus or silent mode can still mute it. Keep your phone's built-in Clock alarm as your real backup. NOOP's phone-based smart wake (light-sleep detection) is available on the Android app.")
-                        .font(StrandFont.footnote)
-                        .foregroundStyle(StrandPalette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    #if os(iOS)
+                    if #available(iOS 26.0, *) {
+                        Text("The strap buzzes silently from its own firmware. The separate phone alarm sounds at your scheduled wake time when enabled. Light-sleep early wake remains available only on Android.")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        legacyAlarmHonestyText
+                    }
+                    #else
+                    legacyAlarmHonestyText
+                    #endif
                 }
             }
         }
     }
+
+    private var legacyAlarmHonestyText: some View {
+        Text("The wake-alarm above buzzes your wrist from the strap's own firmware. It can't sound a loud alarm. We also schedule a backup notification at your wake time, but a sideloaded app can't sound a guaranteed wake on this device (that needs a critical-alert permission this build doesn't have), so Focus or silent mode can still mute it. Keep your phone's built-in Clock alarm as your real backup. NOOP's phone-based smart wake (light-sleep detection) is available on the Android app.")
+            .font(StrandFont.footnote)
+            .foregroundStyle(StrandPalette.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    #if os(iOS)
+    @available(iOS 26.0, *)
+    private var phoneAlarmCard: some View {
+        StrandCard(padding: 20, tint: phoneAlarm.isEnabled ? StrandPalette.accent : nil) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Phone wake alarm")
+                    .font(StrandFont.title2)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Wake me with a phone alarm")
+                            .font(StrandFont.body)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                        Text("Your iPhone sounds at the selected wake time, even if NOOP is closed. Allow alarms when asked. This does not use live heart rate to wake you early.")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { phoneAlarm.isEnabled },
+                        set: { phoneAlarm.setEnabled($0, schedule: phoneSchedule) }
+                    ))
+                    .labelsHidden().toggleStyle(.switch).tint(StrandPalette.accent)
+                    .disabled(phoneAlarm.isBusy)
+                    .accessibilityLabel("Wake me with a phone alarm")
+                }
+                if phoneAlarm.hasError {
+                    Text("Phone alarm could not be updated. Check alarm permission in Settings and try again.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.statusWarning)
+                }
+            }
+        }
+    }
+
+    private var phoneSchedule: PhoneWakeAlarmScheduler.Schedule {
+        .init(baseMinutes: behavior.smartAlarmMinutes,
+              weekdays: behavior.smartAlarmWeekdays,
+              overrides: WindDownNudge.perDayWakeOverrides)
+    }
+    #endif
 
     // MARK: - Strap silent wake-alarm (#766, moved here from Automations)
 
@@ -247,11 +309,9 @@ struct SmartAlarmView: View {
                 }
                 .frame(minHeight: 42)
 
-                // The time itself lives in the wake-time card above, shared with the reminder. This card
-                // only decides WHETHER and on which days the strap buzzes at it.
+                // The time and weekdays live in the shared wake schedule above.
                 if behavior.smartAlarmEnabled {
                     Divider().overlay(StrandPalette.hairline)
-                    alarmWeekdayPicker
                     // #864: a WHOOP 5/MG only arms its firmware alarm when Protocol probes is on (see
                     // BLEManager.armStrapAlarm, which logs "not armed" and returns otherwise). Without this
                     // branch the card claimed "Armed on the strap itself" to a 5/MG owner whose strap was
@@ -305,7 +365,12 @@ struct SmartAlarmView: View {
             .onChangeCompat(of: behavior.smartAlarmEnabled) { _ in model.applySmartAlarm() }
             // Deselecting a day leaves its per-day time alone: the reminder still fires that evening and
             // still reads it, and the time is back as it was if the day is selected again.
-            .onChangeCompat(of: behavior.smartAlarmWeekdays) { _ in model.applySmartAlarm() }
+            .onChangeCompat(of: behavior.smartAlarmWeekdays) { _ in
+                model.applySmartAlarm()
+                #if os(iOS)
+                phoneAlarm.reconcile(schedule: phoneSchedule)
+                #endif
+            }
         }
     }
 
@@ -336,7 +401,7 @@ struct SmartAlarmView: View {
                             .font(StrandFont.body)
                             .foregroundStyle(StrandPalette.textPrimary)
                         // Says when this time wakes anybody, beside the picker people actually read.
-                        Text("Your strap alarm and the wind-down reminder both use this time. It only wakes you when the strap alarm is on.")
+                        Text("Your enabled alarms use this time. The wind-down reminder also uses it.")
                             .font(StrandFont.footnote)
                             .foregroundStyle(StrandPalette.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -348,6 +413,8 @@ struct SmartAlarmView: View {
                 }
                 .frame(minHeight: 42)
 
+                Divider().overlay(StrandPalette.hairline)
+                alarmWeekdayPicker
                 Divider().overlay(StrandPalette.hairline)
                 perDaySection
             }
@@ -432,7 +499,7 @@ struct SmartAlarmView: View {
                 Text("Different wake time per day")
                     .font(StrandFont.body)
                     .foregroundStyle(StrandPalette.textPrimary)
-                Text("Set a wake time for specific days (a lie-in at the weekend, say). These times move your strap alarm AND the evening reminder on those days.")
+                Text("Set a wake time for selected days. These times move your enabled alarms and the evening reminder on those days.")
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -456,7 +523,9 @@ struct SmartAlarmView: View {
 
         if perDayOn {
             VStack(spacing: 6) {
-                ForEach(Self.weekdayOrder, id: \.self) { weekday in
+                ForEach(Self.weekdayOrder.filter {
+                    Self.alarmWeekdayIsSelected($0, in: behavior.smartAlarmWeekdays)
+                }, id: \.self) { weekday in
                     weekdayOverrideRow(weekday)
                 }
             }
@@ -616,6 +685,9 @@ struct SmartAlarmView: View {
     /// disable to the strap, which an edit to the reminder's times has no reason to send.
     private func rearmStrapAlarmIfOn() {
         if behavior.smartAlarmEnabled { model.applySmartAlarm() }
+        #if os(iOS)
+        phoneAlarm.reconcile(schedule: phoneSchedule)
+        #endif
     }
 
     /// One weekday's override row: the day name, the effective wake time (override or default), a picker to

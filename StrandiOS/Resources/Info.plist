@@ -55,6 +55,8 @@
 	<string>public.app-category.healthcare-fitness</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSAlarmKitUsageDescription</key>
+	<string>NOOP schedules the phone wake alarms you enable at your selected wake times.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

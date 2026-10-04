@@ -257,6 +257,12 @@ final class AppModel: ObservableObject {
         self.repo = Repository(deviceId: deviceId)
         self.coach = AICoachEngine(repo: repo)
         self.intelligence = IntelligenceEngine(repo: repo, profile: profile, deviceId: deviceId)
+        #if os(iOS)
+        PhoneWakeAlarmScheduler.shared.onScheduleChanged = { [weak self] in
+            guard let self, self.behavior.smartAlarmEnabled else { return }
+            self.applySmartAlarm()
+        }
+        #endif
         // Route the engine's per-day scoring diagnostic into the SAME shareable strap log every other
         // subsystem writes to (PII-scrubbed by `live.append(log:)`), so a bug report ships proof of what
         // was computed per day. `live` is captured strongly (created just above) , the engine outlives the
@@ -1710,6 +1716,15 @@ final class AppModel: ObservableObject {
             return
         }
         ble.armStrapAlarm(at: next)
+        #if os(iOS)
+        if #available(iOS 26.0, *), PhoneWakeAlarmScheduler.shared.hasCurrentAlarm(for: .init(
+            baseMinutes: behavior.smartAlarmMinutes,
+            weekdays: behavior.smartAlarmWeekdays,
+            overrides: overrides)) {
+            Self.cancelSmartAlarmBackupNotification()
+            return
+        }
+        #endif
         // Replace (remove + re-add by stable identifier) on every re-arm so the backup never stacks.
         // The log sink hops to the main actor because the auth check completes off-main and LiveState is
         // @MainActor - the same Task hop the importTraceSink uses.
